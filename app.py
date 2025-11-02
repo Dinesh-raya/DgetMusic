@@ -3,19 +3,11 @@ from streamlit_javascript import st_javascript
 import json
 import yt_dlp
 import base64
-from datetime import timedelta
-import re
 
-# ---------------------------------------------------
-# Streamlit Config
-# ---------------------------------------------------
 st.set_page_config(page_title="Music Downloader", page_icon="🎵")
 
-# ---------------------------------------------------
-# Password Protection
-# ---------------------------------------------------
+# -------------------- Password Auth --------------------
 def check_password():
-    """Returns True if the user entered the correct password."""
     def password_entered():
         if st.session_state["password"] == st.secrets["password"]:
             st.session_state["password_correct"] = True
@@ -33,10 +25,7 @@ def check_password():
     else:
         return True
 
-
-# ---------------------------------------------------
-# Local Storage Helpers
-# ---------------------------------------------------
+# -------------------- Local Storage Helpers --------------------
 def get_from_local_storage(k):
     v = st_javascript(f"JSON.parse(localStorage.getItem('{k}'));")
     return v or {}
@@ -45,10 +34,7 @@ def set_to_local_storage(k, v):
     jdata = json.dumps(v)
     st_javascript(f"localStorage.setItem('{k}', JSON.stringify({jdata}));")
 
-
-# ---------------------------------------------------
-# Auth Flow
-# ---------------------------------------------------
+# -------------------- Auth Flow --------------------
 if get_from_local_storage("password_correct"):
     authenticated = True
 else:
@@ -58,23 +44,11 @@ if authenticated:
     set_to_local_storage("password_correct", True)
 
     st.title("🎶 YouTube Music Downloader")
-    st.write("""
-    Download or listen to music directly from YouTube in audio format (MP3).
-    Choose between single or batch downloads.
-    Videos over 10 minutes are skipped for faster performance.
-    """)
-    st.warning("""
-    ⚠️ **Disclaimer:** This app is for personal and educational use only.
-    It is not affiliated with YouTube and should not be used for redistribution or commercial purposes.
-    """)
+    st.write("Download or listen to music directly from YouTube in audio format (MP3).")
+    st.warning("⚠️ This app is for personal use only and not affiliated with YouTube.")
 
-    st.markdown("---")
-
-    # ---------------------------------------------------
-    # Helper Functions
-    # ---------------------------------------------------
+    # -------------------- Helpers --------------------
     def get_binary_file_downloader_html(bin_file, song_title):
-        """Generate download link for MP3 file."""
         with open(bin_file, 'rb') as f:
             data = f.read()
         bin_str = base64.b64encode(data).decode()
@@ -82,20 +56,17 @@ if authenticated:
         return href
 
     def searchYouTube(query):
-        """Search YouTube using yt_dlp and return up to 10 results under 10min."""
         ydl_opts = {
             'quiet': True,
             'noplaylist': True,
             'default_search': 'ytsearch10',
             'skip_download': True,
         }
-
         results = []
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(query, download=False)
-                entries = info.get('entries', [])
-                for entry in entries:
+                for entry in info.get('entries', []):
                     title = entry.get('title')
                     duration = entry.get('duration')
                     video_id = entry.get('id')
@@ -111,7 +82,6 @@ if authenticated:
             return []
 
     def downloadYTFromLink(link, song_title):
-        """Download and play song as MP3."""
         ydl_opts = {
             'format': 'bestaudio/best',
             'quiet': True,
@@ -122,27 +92,27 @@ if authenticated:
             }],
             'outtmpl': 'song',
         }
-
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.cache.remove()
                 ydl.download([link])
             st.audio("song.mp3")
             st.markdown(get_binary_file_downloader_html("song.mp3", song_title), unsafe_allow_html=True)
+        except yt_dlp.utils.DownloadError as e:
+            if "not available" in str(e).lower() or "unavailable" in str(e).lower():
+                st.error("⚠️ This song is geo-restricted and unavailable in your region.")
+            else:
+                st.error(f"Download failed: {e}")
         except Exception as e:
             st.error(f"Error downloading: {e}")
 
+    # -------------------- Tabs --------------------
+    tab1, tab2 = st.tabs(["🎧 Download Song", "📦 Batch Download"])
 
-    # ---------------------------------------------------
-    # UI Tabs
-    # ---------------------------------------------------
-    downloadMusic, batchDownload = st.tabs(["🎧 Download Song", "📦 Batch Download"])
-
-    # ---- SINGLE SONG DOWNLOAD ----
     def is_checkbox_filled():
         return 'songSelection' in st.session_state and st.session_state['songSelection']
 
-    with downloadMusic:
+    with tab1:
         st.subheader("Download a specific song")
 
         with st.form("search_form"):
@@ -150,6 +120,11 @@ if authenticated:
             submit_button = st.form_submit_button("Get Relevant Songs")
 
         if submit_button or is_checkbox_filled():
+            if "last_query" in st.session_state and st.session_state["last_query"] != search:
+                for key in ["options", "options_titles", "songSelection"]:
+                    st.session_state.pop(key, None)
+            st.session_state["last_query"] = search
+
             if not is_checkbox_filled():
                 st.info("Retrieving search results...")
                 options = searchYouTube(search)
@@ -159,8 +134,10 @@ if authenticated:
 
                 options.insert(0, ("Select a song (disabled)", None, None))
                 options = [(idx, opt[0], opt[1], opt[2]) for idx, opt in enumerate(options)]
+
                 options_titles = ["Select a song (disabled)"]
-                options_titles.extend([f"{idx+1}. {opt[1]} ({opt[2]})" for idx, opt in enumerate(options[1:])])
+                options_titles.extend([f"{idx+1}. {opt[0]} — {opt[1]}" for idx, opt in enumerate(options[1:])])
+
                 st.session_state['options_titles'] = options_titles
                 st.session_state['options'] = options
             else:
@@ -174,8 +151,7 @@ if authenticated:
                 st.success(f"Downloading: {options[choice[0]][1]}")
                 downloadYTFromLink(options[choice[0]][3], options[choice[0]][1])
 
-    # ---- BATCH DOWNLOAD ----
-    with batchDownload:
+    with tab2:
         st.subheader("Batch Download (downloads first result per song)")
         getSongs = st.text_input("Enter songs separated by commas:")
 
