@@ -1,333 +1,221 @@
 import streamlit as st
-from streamlit_javascript import st_javascript
-import json
 import yt_dlp
+import json
 import base64
 import tempfile
 import os
 import re
+import time
+from urllib.parse import urlparse
 
-st.set_page_config(page_title="Music Downloader", page_icon="🎵")
+st.set_page_config(page_title="DgetMusic — Pro", layout="wide")
+st.title("🎵 DgetMusic — Stream & Download Audio (Cookie-free, Pro UI)")
+st.markdown("Lightweight, cloud-friendly music streamer. No cookies needed.")
 
-# -------------------- Password Auth --------------------
-def check_password():
-    def password_entered():
-        if st.session_state["password"] == st.secrets["password"]:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
+def safe_filename(s, max_len=120):
+    if not s:
+        return "audio"
+    s = re.sub(r'[\\/*?:"<>|]', "_", s)
+    return s[:max_len]
 
-    if "password_correct" not in st.session_state:
-        st.text_input("Password", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.text_input("Password", type="password", on_change=password_entered, key="password")
-        st.error("😕 Password incorrect")
-        return False
-    else:
-        return True
-
-# -------------------- Local Storage Helpers --------------------
-def get_from_local_storage(k):
-    v = st_javascript(f"JSON.parse(localStorage.getItem('{k}'));")
-    return v or {}
-
-def set_to_local_storage(k, v):
-    jdata = json.dumps(v)
-    st_javascript(f"localStorage.setItem('{k}', JSON.stringify({jdata}));")
-
-# -------------------- Helpers --------------------
 def get_binary_file_downloader_html(bin_file, song_title):
-    with open(bin_file, 'rb') as f:
-        data = f.read()
+    try:
+        with open(bin_file, "rb") as f:
+            data = f.read()
+    except Exception:
+        return ""
     bin_str = base64.b64encode(data).decode()
-    safe_title = re.sub(r'[\\/*?:"<>|]', '_', song_title)[:120]
-    href = f'<a href="data:application/octet-stream;base64,{bin_str}" download="{safe_title}.mp3">Download {safe_title}</a>'
+    safe = safe_filename(song_title)
+    href = f'<a href="data:application/octet-stream;base64,{bin_str}" download="{safe}.mp3">⬇️ Download {safe}</a>'
     return href
 
-def _write_cookies_to_file(cookie_text):
-    """Write Netscape-format cookie text to a temporary file and return path."""
-    if not cookie_text or not cookie_text.strip():
-        return None
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-    tmp.write(cookie_text.encode("utf-8"))
-    tmp.flush()
-    tmp.close()
-    return tmp.name
-
-def _remove_temp_file(path):
-    try:
-        if path and os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
-
-def searchYouTube(query):
-    ydl_opts = {
-        'quiet': True,
-        'noplaylist': True,
-        'default_search': 'ytsearch10',
-        'skip_download': True,
-    }
+@st.cache_data(show_spinner=False)
+def search_youtube(query):
+    ydl_opts = {"quiet": True, "skip_download": True, "noplaylist": True, "default_search": "ytsearch10"}
     results = []
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(query, download=False)
-            for entry in info.get('entries', []):
-                title = entry.get('title')
-                duration = entry.get('duration')
-                video_id = entry.get('id')
-                if not duration or duration > 600:
+            entries = info.get("entries") or []
+            for e in entries:
+                title = e.get("title")
+                vid = e.get("id") or e.get("webpage_url")
+                duration = e.get("duration") or 0
+                if duration and duration > 60*20:
                     continue
-                minutes = duration // 60
-                seconds = duration % 60
-                dur_str = f"{minutes}:{seconds:02d}"
-                results.append((title, dur_str, f"https://www.youtube.com/watch?v={video_id}"))
-        return results
+                thumb = None
+                if e.get("thumbnails"):
+                    thumb = e.get("thumbnails")[-1].get("url")
+                results.append({"title": title, "url": f"https://www.youtube.com/watch?v={vid}" if len(str(vid))==11 else vid, "id": vid, "duration": duration, "thumb": thumb})
     except Exception as e:
-        st.error(f"Search failed: {e}")
-        return []
+        st.warning(f"Search failed: {e}")
+    return results
 
-# -------------------- URL detection --------------------
 def is_youtube_url(text):
     if not text:
         return False
     text = text.strip()
-    return ("youtube.com/watch" in text) or ("youtu.be/" in text)
+    return "youtube.com/watch" in text or "youtu.be/" in text or "list=" in text
 
-def extract_title_from_url(url):
+def extract_audio_url(video_url):
+    ydl_opts = {"quiet": True, "skip_download": True, "format": "bestaudio/best"}
     try:
-        ydl_opts = {'quiet': True, 'skip_download': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            title = info.get('title') or "Direct Audio"
-            return title
-    except Exception:
-        return "Direct Audio"
-
-# -------------------- Robust downloader with secret-cookie fallback + paste override --------------------
-def downloadYTFromLink(link, song_title):
-    """
-    Behaviour:
-    1) Try streaming (no cookies) -> fast
-    2) If restricted (403 / login required / age restriction), try with secret cookies (if present)
-       and show an info message: "This video requires sign-in. Using stored cookies from app secrets to try access."
-    3) If still blocked, show an expander to paste cookies and retry using pasted cookies.
-    4) If pasted cookies used, show info: "User-supplied cookies are being used for this download."
-    """
-
-    # browser-like headers
-    http_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.youtube.com/",
-    }
-
-    # helper to attempt streaming (extract_info -> get direct audio url)
-    def try_stream(cookiefile=None, proxy=None):
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "quiet": True,
-            "skip_download": True,
-            "nocheckcertificate": True,
-            "http_headers": http_headers,
-        }
-        if cookiefile:
-            ydl_opts["cookiefile"] = cookiefile
-        if proxy:
-            ydl_opts["geo_verification_proxy"] = proxy
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(link, download=False)
-            audio_url = info.get("url")
-            if not audio_url:
-                for f in info.get("formats", []):
-                    if f.get("acodec") != "none" and f.get("url"):
-                        audio_url = f.get("url")
-                        break
-            return audio_url, info
-
-    # helper to do full download to mp3
-    def try_download(cookiefile=None, proxy=None):
-        ydl_download_opts = {
-            "format": "bestaudio/best",
-            "quiet": True,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-            "outtmpl": "song",
-            "nocheckcertificate": True,
-            "http_headers": http_headers,
-        }
-        if cookiefile:
-            ydl_download_opts["cookiefile"] = cookiefile
-        if proxy:
-            ydl_download_opts["geo_verification_proxy"] = proxy
-        with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:
-            ydl.cache.remove()
-            ydl.download([link])
-
-    # Step 1: Try fast streaming without cookies
-    try:
-        audio_url, info = try_stream(cookiefile=None, proxy=st.secrets.get("geo_verification_proxy", None))
-        if audio_url:
-            st.caption("Playing audio (no cookies required).")
-            st.audio(audio_url)
-            return
+            info = ydl.extract_info(video_url, download=False)
+            formats = info.get("formats") or []
+            audio_formats = [f for f in formats if f.get("acodec") and (not f.get("vcodec") or f.get("vcodec") in ("none", ""))]
+            if not audio_formats:
+                for f in formats:
+                    if f.get("url"):
+                        return f.get("url"), info.get("title")
+                return None, info.get("title")
+            best = sorted(audio_formats, key=lambda x: x.get("abr") or 0, reverse=True)[0]
+            return best.get("url"), info.get("title")
     except Exception as e:
-        err_msg = str(e).lower()
+        return None, None
 
-    # detect likely restriction keywords from exception or info (if available)
-    def _is_restriction_error(msg_or_info):
-        s = ""
-        if isinstance(msg_or_info, str):
-            s = msg_or_info.lower()
+def expand_playlist(playlist_url):
+    try:
+        ydl_opts = {"quiet": True, "skip_download": True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(playlist_url, download=False)
+            entries = info.get("entries") or []
+            urls = []
+            for e in entries:
+                vid = e.get("id") or e.get("webpage_url")
+                if vid:
+                    if len(str(vid))==11:
+                        urls.append(f"https://www.youtube.com/watch?v={vid}")
+                    else:
+                        urls.append(vid)
+            return urls
+    except Exception as e:
+        st.warning(f"Playlist expansion failed: {e}")
+        return []
+
+if "history" not in st.session_state:
+    st.session_state["history"] = []
+if "now_playing" not in st.session_state:
+    st.session_state["now_playing"] = {"url": None, "title": None, "thumb": None}
+
+def add_history(q):
+    q = q.strip()
+    if not q:
+        return
+    hist = st.session_state["history"]
+    if q in hist:
+        hist.remove(q)
+    hist.insert(0, q)
+    st.session_state["history"] = hist[:10]
+
+def show_floating_player(audio_url, title=None, thumb=None):
+    safe_title = title or "Now playing"
+    thumb_html = f'<img src="{thumb}" style="height:40px;width:40px;border-radius:4px;margin-right:8px;" />' if thumb else ""
+    player_html = f'''<div id="dget_floating" style="position:fixed;right:18px;bottom:18px;background:rgba(0,0,0,0.75);color:#fff;padding:8px 12px;border-radius:10px;z-index:9999;display:flex;align-items:center;box-shadow:0 6px 18px rgba(0,0,0,0.35);">{thumb_html}<div style="display:flex;flex-direction:column;min-width:200px;"><div style="font-size:14px;font-weight:600;">{safe_title}</div><audio controls id="dget_audio" style="width:300px;"><source src="{audio_url}" /></audio></div></div>'''
+    st.components.v1.html(player_html, height=120, scrolling=False)
+
+st.markdown("## Single Song — Search or Paste URL")
+left, right = st.columns([3,1])
+
+with right:
+    st.caption("Recent searches (local)")
+    for h in st.session_state["history"]:
+        if st.button(h, key=f"hist_{h}"):
+            st.experimental_set_query_params(q=h)
+            st.session_state["_prefill"] = h
+
+with left:
+    q = st.text_input("Enter song name or YouTube URL", value=st.session_state.get("_prefill",""))
+    search_col1, search_col2 = st.columns([3,1])
+    with search_col2:
+        go = st.button("Search / Play")
+    if go:
+        add_history(q)
+        if not q or not q.strip():
+            st.warning("Please enter a search term or URL.")
         else:
-            s = str(msg_or_info).lower()
-        keys = ["403", "forbidden", "sign in", "sign-in", "login required", "age-restricted", "age restricted", "not available", "private video", "protected content", "needs login", "account required"]
-        return any(k in s for k in keys)
-
-    # Step 2: Try with secret cookies (if present)
-    secret_cookie_text = st.secrets.get("youtube_cookies", "").strip()
-    secret_cookie_file = None
-    tried_with_secret = False
-    if secret_cookie_text:
-        # indicate to user in an info box (you chose option A: st.info)
-        st.info("This video requires sign-in or is restricted. Using stored cookies from app secrets to try access.")
-        secret_cookie_file = _write_cookies_to_file(secret_cookie_text)
-        tried_with_secret = True
-        try:
-            audio_url, info = try_stream(cookiefile=secret_cookie_file, proxy=st.secrets.get("geo_verification_proxy", None))
-            if audio_url:
-                st.caption("Playing audio using stored cookies.")
-                st.audio(audio_url)
-                _remove_temp_file(secret_cookie_file)
-                return
-        except Exception as e:
-            err_msg = str(e).lower()
-
-    # Step 3: Attempt full download with secret cookies (if tried)
-    if tried_with_secret:
-        try:
-            try_download(cookiefile=secret_cookie_file, proxy=st.secrets.get("geo_verification_proxy", None))
-            st.audio("song.mp3")
-            st.markdown(get_binary_file_downloader_html("song.mp3", song_title), unsafe_allow_html=True)
-            _remove_temp_file(secret_cookie_file)
-            return
-        except Exception as e:
-            err_msg = str(e).lower()
-            _remove_temp_file(secret_cookie_file)
-
-    # Step 4: If still failing, show optional paste-expander for user-supplied cookies
-    show_exp = st.expander("Optional: Paste your own YouTube cookies (Netscape format) to access age-restricted / sign-in videos")
-    with show_exp:
-        pasted = st.text_area("Paste cookies.txt content here (Netscape format). Leave empty to skip.", height=200, key=f"paste_{song_title}")
-        use_pasted = st.button("Use pasted cookies for this attempt", key=f"use_{song_title}")
-        if use_pasted and pasted.strip():
-            user_cookie_file = _write_cookies_to_file(pasted.strip())
-            st.info("User-supplied cookies are being used for this download.")
-            try:
-                # first try streaming
-                audio_url, info = try_stream(cookiefile=user_cookie_file, proxy=st.secrets.get("geo_verification_proxy", None))
-                if audio_url:
-                    st.caption("Playing audio using user-supplied cookies.")
-                    st.audio(audio_url)
-                    _remove_temp_file(user_cookie_file)
-                    return
-            except Exception:
-                pass
-            try:
-                try_download(cookiefile=user_cookie_file, proxy=st.secrets.get("geo_verification_proxy", None))
-                st.audio("song.mp3")
-                st.markdown(get_binary_file_downloader_html("song.mp3", song_title), unsafe_allow_html=True)
-                _remove_temp_file(user_cookie_file)
-                return
-            except Exception as e:
-                st.error(f"Download failed even with user cookies: {e}")
-                _remove_temp_file(user_cookie_file)
-                return
-
-    # If we reach here, we couldn't get it
-    st.error("Unable to retrieve this video/audio. It may be geo-restricted, age-restricted, or require a logged-in account. Try pasting cookies above or running locally with your account cookies.")
-
-# -------------------- Streamlit UI --------------------
-if get_from_local_storage("password_correct"):
-    authenticated = True
-else:
-    authenticated = check_password()
-
-if authenticated:
-    set_to_local_storage("password_correct", True)
-
-    st.title("🎶 YouTube Music Downloader")
-    st.write("Download or listen to music directly from YouTube in audio format (MP3).")
-    st.warning("⚠️ This app is for personal use only and not affiliated with YouTube.")
-
-    # Tabs
-    tab1, tab2 = st.tabs(["🎧 Download Song", "📦 Batch Download"])
-
-    def is_checkbox_filled():
-        return 'songSelection' in st.session_state and st.session_state['songSelection']
-
-    with tab1:
-        st.subheader("Download a specific song")
-
-        with st.form("search_form"):
-            search = st.text_input("Search for a song or paste a YouTube URL:")
-            submit_button = st.form_submit_button("Get Relevant Songs")
-
-        if submit_button or is_checkbox_filled():
-            # If input is a YouTube URL -> Option A behaviour (direct download)
-            if is_youtube_url(search):
-                st.info("Detected YouTube URL — retrieving audio...")
-                title = extract_title_from_url(search)
-                downloadYTFromLink(search, title)
-            else:
-                # Add-on: Refresh when new input given
-                if "last_query" in st.session_state and st.session_state["last_query"] != search:
-                    for key in ["options", "options_titles", "songSelection"]:
-                        st.session_state.pop(key, None)
-                st.session_state["last_query"] = search
-
-                if not is_checkbox_filled():
-                    st.info("Retrieving search results...")
-                    options = searchYouTube(search)
-                    if not options:
-                        st.warning("No valid results found.")
-                        st.stop()
-
-                    options.insert(0, ("Select a song (disabled)", None, None))
-                    options = [(idx, opt[0], opt[1], opt[2]) for idx, opt in enumerate(options)]
-
-                    options_titles = ["Select a song (disabled)"]
-                    options_titles.extend([f"{idx+1}. {opt[0]} — {opt[1]}" for idx, opt in enumerate(options[1:])])
-
-                    st.session_state['options_titles'] = options_titles
-                    st.session_state['options'] = options
+            if "list=" in q or "playlist" in q:
+                st.info("Detected playlist — expanding...")
+                urls = expand_playlist(q)
+                if not urls:
+                    st.error("No videos found in playlist or expansion failed.")
                 else:
-                    options_titles = st.session_state['options_titles']
-                    options = st.session_state['options']
+                    st.success(f"Expanded {len(urls)} videos. Showing first 10 for preview.")
+                    for u in urls[:10]:
+                        aurl, title = extract_audio_url(u)
+                        if aurl:
+                            st.write(title or u)
+                            st.audio(aurl)
+                            st.markdown(f'<a href="{aurl}" download="{safe_filename(title)}.mp3">⬇️ Download Audio (Direct)</a>', unsafe_allow_html=True)
+                            show_floating_player(aurl, title)
+                        else:
+                            st.write("Could not extract:", u)
+            else:
+                if is_youtube_url(q):
+                    audio_url, title = extract_audio_url(q)
+                    if audio_url:
+                        st.success(f"Now playing: {title or q}")
+                        st.image(None)
+                        st.audio(audio_url)
+                        st.markdown(f'<a href="{audio_url}" download="{safe_filename(title or q)}.mp3">⬇️ Download Audio (Direct)</a>', unsafe_allow_html=True)
+                        show_floating_player(audio_url, title)
+                    else:
+                        st.error("Could not extract audio for this URL.")
+                else:
+                    results = search_youtube(q)
+                    if not results:
+                        st.warning("No search results.")
+                    else:
+                        for idx, r in enumerate(results[:5], start=1):
+                            st.markdown(f"### {idx}. {r['title']}")
+                            cols = st.columns([1,3,1])
+                            with cols[0]:
+                                if r.get("thumb"):
+                                    st.image(r["thumb"], width=120)
+                            with cols[1]:
+                                st.write(f"Duration: {int(r.get('duration',0)//60)}:{int(r.get('duration',0)%60):02d}")
+                                if st.button(f"Play {idx}", key=f"play_{idx}_{r['id']}"):
+                                    aurl, title = extract_audio_url(r["url"])
+                                    if aurl:
+                                        st.success(f"Now playing: {title}")
+                                        st.audio(aurl)
+                                        st.markdown(f'<a href="{aurl}" download="{safe_filename(title)}.mp3">⬇️ Download Audio (Direct)</a>', unsafe_allow_html=True)
+                                        show_floating_player(aurl, title)
+                                    else:
+                                        st.error("Could not extract audio from this result.")
 
-                choice = st.selectbox("Choose a song", options, format_func=lambda x: options_titles[x[0]])
-                st.session_state['songSelection'] = choice
+st.markdown("---")
+st.markdown("## Batch Download / Stream (comma-separated names or URLs)")
+batch_input = st.text_area("Enter names or YouTube URLs separated by commas:", height=140, placeholder="name1, name2, https://youtu.be/abcd, name3")
+play_all = st.checkbox("Play all sequentially (in-page)", value=False)
+do_zip = False
 
-                if choice[0] != 0 and is_checkbox_filled():
-                    st.success(f"Downloading: {options[choice[0]][1]}")
-                    downloadYTFromLink(options[choice[0]][3], options[choice[0]][1])
-
-    with tab2:
-        st.subheader("Batch Download (downloads first result per song)")
-        getSongs = st.text_input("Enter songs separated by commas:")
-
-        if st.button("Get Songs"):
-            songs = [s.strip() for s in getSongs.split(",") if s.strip()]
-            for song in songs:
-                st.info(f"Searching: {song}")
-                options = searchYouTube(song)
-                if not options:
-                    st.warning(f"No valid result for: {song}")
+if st.button("Process Batch"):
+    items = [it.strip() for it in (batch_input or "").split(",") if it.strip()]
+    if not items:
+        st.warning("Provide at least one name or URL.")
+    else:
+        for i, it in enumerate(items, start=1):
+            st.markdown(f"### {i}. {it}")
+            if is_youtube_url(it):
+                url = it
+            else:
+                res = search_youtube(it)
+                if not res:
+                    st.warning(f"No result for: {it}")
                     continue
-                st.success(f"Downloading: {options[0][0]}")
-                downloadYTFromLink(options[0][2], options[0][0])
+                url = res[0]["url"] if isinstance(res[0], dict) else res[0][2]
+            audio_url, title = extract_audio_url(url)
+            if audio_url:
+                st.write(f"**{title or it}**")
+                if play_all:
+                    st.audio(audio_url)
+                else:
+                    st.audio(audio_url)
+                st.markdown(f'<a href="{audio_url}" download="{safe_filename(title or it)}.mp3">⬇️ Download Audio (Direct)</a>', unsafe_allow_html=True)
+                show_floating_player(audio_url, title or it)
+            else:
+                st.error(f"Could not extract audio for: {it}")
+
+st.markdown("---")
+st.info("This lightweight Pro UI is cookie-free and cloud-friendly. For restricted videos, cookies or OAuth are required which are intentionally disabled in this build.")
