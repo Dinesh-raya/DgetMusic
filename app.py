@@ -8,8 +8,8 @@ import os
 import re
 from urllib.parse import urlparse
 
-st.set_page_config(page_title="DgetMusic — Fixed", layout="wide")
-st.title("🎵 DgetMusic — Fixed (cookie-free)")
+st.set_page_config(page_title="DgetMusic — Fixed (v2)", layout="wide")
+st.title("🎵 DgetMusic — Fixed (cookie-free, v2)")
 
 # -------------------- Helpers --------------------
 def safe_filename(s, max_len=120):
@@ -125,8 +125,8 @@ def expand_playlist(playlist_url):
 # -------------------- Session state --------------------
 if "history" not in st.session_state:
     st.session_state["history"] = []
-if "now_playing" not in st.session_state:
-    st.session_state["now_playing"] = {"url": None, "title": None, "thumb": None}
+if "play_request" not in st.session_state:
+    st.session_state["play_request"] = None
 
 def add_history(q):
     q = (q or "").strip()
@@ -137,26 +137,6 @@ def add_history(q):
         hist.remove(q)
     hist.insert(0, q)
     st.session_state["history"] = hist[:10]
-
-# Floating player shown only for single-item play (not in batch)
-def show_floating_player(audio_url, title=None, thumb=None):
-    if not audio_url:
-        return
-    safe_title = title or "Now playing"
-    thumb_html = f'<img src="{thumb}" style="height:40px;width:40px;border-radius:4px;margin-right:8px;" />' if thumb else ""
-    player_html = f'''
-    <div id="dget_floating" style="position:fixed;right:18px;bottom:18px;background:rgba(0,0,0,0.75);color:#fff;padding:8px 12px;border-radius:10px;z-index:9999;display:flex;align-items:center;box-shadow:0 6px 18px rgba(0,0,0,0.35);">
-      {thumb_html}
-      <div style="display:flex;flex-direction:column;min-width:200px;">
-        <div style="font-size:14px;font-weight:600;">{safe_title}</div>
-        <audio controls id="dget_audio" style="width:300px;">
-          <source src="{audio_url}" />
-          Your browser does not support the audio element.
-        </audio>
-      </div>
-    </div>
-    '''
-    st.components.v1.html(player_html, height=140, scrolling=False)
 
 # -------------------- UI: Single song --------------------
 st.markdown("## Single Song — Search or Paste URL")
@@ -193,8 +173,7 @@ with left:
                             st.write(title or u)
                             st.audio(aurl)
                             st.markdown(f'<a href="{aurl}" download="{safe_filename(title)}.mp3">⬇️ Download Audio (Direct)</a>', unsafe_allow_html=True)
-                            # Floating player for single-mode playlist preview: show first only
-                            # show_floating_player(aurl, title)
+                            # NOTE: floating player removed here per your request
                         else:
                             st.write("Could not extract:", u)
             else:
@@ -204,7 +183,7 @@ with left:
                         st.success(f"Now playing: {title or q}")
                         st.audio(audio_url)
                         st.markdown(f'<a href="{audio_url}" download="{safe_filename(title or q)}.mp3">⬇️ Download Audio (Direct)</a>', unsafe_allow_html=True)
-                        show_floating_player(audio_url, title)
+                        # NOTE: floating player removed here per your request
                     else:
                         st.error("Could not extract audio for this URL.")
                 else:
@@ -222,15 +201,26 @@ with left:
                             with cols[1]:
                                 dur = r.get("duration") or 0
                                 st.write(f"Duration: {int(dur//60)}:{int(dur%60):02d}")
-                                if st.button(f"Play {idx}", key=f"play_{idx}_{str(r.get('id'))}"):
-                                    aurl, title = extract_audio_url(r["url"])
-                                    if aurl:
-                                        st.success(f"Now playing: {title}")
-                                        st.audio(aurl)
-                                        st.markdown(f'<a href="{aurl}" download="{safe_filename(title)}.mp3">⬇️ Download Audio (Direct)</a>', unsafe_allow_html=True)
-                                        show_floating_player(aurl, title, r.get("thumb"))
-                                    else:
-                                        st.error("Could not extract audio from this result.")
+                                # when clicked, store a play request to session_state (robust across reruns)
+                                btn_key = f"play_btn_{idx}_{str(r.get('id'))}"
+                                if st.button("Play", key=btn_key):
+                                    # store the target url + title to be processed after render
+                                    st.session_state["play_request"] = {"url": r["url"], "title": r.get("title"), "thumb": r.get("thumb")}
+                            with cols[2]:
+                                st.write("")  # reserved column for spacing
+
+# After UI creation: handle any pending play_request
+if st.session_state.get("play_request"):
+    req = st.session_state.pop("play_request")  # remove after reading
+    target_url = req.get("url")
+    target_title = req.get("title") or target_url
+    audio_url, title = extract_audio_url(target_url)
+    if audio_url:
+        st.success(f"Now playing: {title or target_title}")
+        st.audio(audio_url)
+        st.markdown(f'<a href="{audio_url}" download="{safe_filename(title or target_title)}.mp3">⬇️ Download Audio (Direct)</a>', unsafe_allow_html=True)
+    else:
+        st.error("Could not extract audio for the selected item.")
 
 st.markdown("---")
 
@@ -256,8 +246,7 @@ if st.button("Process Batch"):
             audio_url, title = extract_audio_url(url)
             if audio_url:
                 st.write(f"**{title or it}**")
-                # in batch mode, we do not show the floating player to avoid clutter
-                # show audio player inline
+                # inline player only; floating player intentionally NOT used in batch mode
                 st.audio(audio_url)
                 st.markdown(f'<a href="{audio_url}" download="{safe_filename(title or it)}.mp3">⬇️ Download Audio (Direct)</a>', unsafe_allow_html=True)
             else:
